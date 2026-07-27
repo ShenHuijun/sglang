@@ -3319,4 +3319,9 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.RUNAI_STREAMER:
         return RunaiModelStreamerLoader(load_config)
 
+    if load_config.load_format == LoadFormat.HF3FS:
+        from sglang.srt.model_loader.hf3fs_loader import Hf3fsModelLoader
+
+        return Hf3fsModelLoader(load_config)
+
     return DefaultModelLoader(load_config)
