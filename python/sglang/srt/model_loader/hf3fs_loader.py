@@ -55,7 +55,11 @@ from sglang.srt.model_loader.loader import (
     _get_quantization_config,
     _initialize_model,
 )
-from sglang.srt.utils import set_default_torch_dtype
+
+try:
+    from sglang.srt.utils import set_default_torch_dtype
+except ImportError:  # older releases (e.g. 0.5.11)
+    from sglang.srt.model_loader.utils import set_default_torch_dtype
 
 try:  # sglang main (>=0.5.x post)
     from sglang.srt.runtime_context import get_parallel
