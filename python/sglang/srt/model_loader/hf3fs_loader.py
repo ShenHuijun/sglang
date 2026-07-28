@@ -54,10 +54,41 @@ from sglang.srt.model_loader.loader import (
     ShardedStateLoader,
     _get_quantization_config,
     _initialize_model,
-    _post_load_weights,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import set_default_torch_dtype
+
+try:  # sglang main (>=0.5.x post)
+    from sglang.srt.runtime_context import get_parallel
+
+    def _tp_rank() -> int:
+        return get_parallel().tp_rank
+
+    def _tp_size() -> int:
+        return get_parallel().tp_size
+
+except ImportError:  # older releases (e.g. 0.5.11)
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    def _tp_rank() -> int:
+        return get_tensor_model_parallel_rank()
+
+    def _tp_size() -> int:
+        return get_tensor_model_parallel_world_size()
+
+
+try:
+    from sglang.srt.model_loader.loader import _post_load_weights
+except ImportError:  # older releases without the shared helper
+
+    def _post_load_weights(model: nn.Module) -> None:
+        # Loaders that bypass model.load_weights() must trigger the post-load
+        # fixup explicitly (see loader.py in newer releases).
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
+
 
 logger = logging.getLogger(__name__)
 
@@ -709,8 +740,8 @@ class Hf3fsModelLoader(BaseModelLoader):
             )
 
         quant_config = _get_quantization_config(model_config, self.load_config)
-        tp_rank = get_parallel().tp_rank
-        tp_size = get_parallel().tp_size
+        tp_rank = _tp_rank()
+        tp_size = _tp_size()
 
         t0 = time.perf_counter()
         ckpt_index = build_ckpt_index(local_model_path)
