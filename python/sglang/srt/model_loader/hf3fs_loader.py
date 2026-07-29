@@ -36,6 +36,7 @@ import ctypes
 import glob
 import json
 import logging
+import mmap
 import os
 import re
 import struct
@@ -428,6 +429,7 @@ class LoadPart:
     rows_local: int = 0  # for COLUMN: rows this rank owns from this tensor
     dst_dim0_offset: int = 0  # where this part lands in the param (or param[e])
     expert_id: Optional[int] = None
+    src_row0: Optional[int] = None  # explicit ckpt start row (KV-head replication)
 
 
 @dataclass
@@ -449,13 +451,15 @@ def _div(a: int, b: int) -> int:
 
 
 def column_segment_ranges(
-    loc: TensorLoc, tp_rank: int, rows_local: int
+    loc: TensorLoc, tp_rank: int, rows_local: int, start_row: Optional[int] = None
 ) -> List[Tuple[int, int]]:
     """Byte ranges of this rank's dim0 segment of a row-major tensor.
-    Clips against the actual checkpoint rows (vocab-padding safe)."""
+    Clips against the actual checkpoint rows (vocab-padding safe).
+    start_row overrides the default tp_rank*rows_local (KV-head replication)."""
     rows_full = loc.shape[0]
     row_bytes = loc.nbytes // rows_full
-    start_row = tp_rank * rows_local
+    if start_row is None:
+        start_row = tp_rank * rows_local
     if start_row >= rows_full:
         return []  # this rank is fully padding
     end_row = min(start_row + rows_local, rows_full)
@@ -530,17 +534,35 @@ class ShardPlanner:
                     f"supported in v1 (shard boundaries inside the fused tensor "
                     f"require model-specific head sizes)"
                 )
+            q_loc = self.ckpt[f"{prefix}q_proj.weight"]
+            k_loc = self.ckpt[f"{prefix}k_proj.weight"]
+            v_loc = self.ckpt[f"{prefix}v_proj.weight"]
+            q_local = _div(q_loc.shape[0], world)
+            rem = param_shape[0] - q_local
+            assert rem > 0 and rem % 2 == 0, (
+                f"{param_name}: cannot split kv rows {rem} from param "
+                f"{tuple(param_shape)} (q_local={q_local})"
+            )
+            kv_local = rem // 2
             dst = 0
-            for comp in ("q_proj", "k_proj", "v_proj"):
-                ckpt_name = f"{prefix}{comp}.weight"
-                loc = self.ckpt[ckpt_name]
-                rows_local = _div(loc.shape[0], world)
+            for comp, loc in (("q_proj", q_loc), ("k_proj", k_loc), ("v_proj", v_loc)):
+                rows_local = q_local if comp == "q_proj" else kv_local
+                if rows_local * world == loc.shape[0]:
+                    src_row0 = None  # standard even split: rank * rows_local
+                else:
+                    # GQA KV-head replication (num_kv_heads < tp_size): the
+                    # ckpt splits into loc.shape[0]/rows_local groups, each
+                    # shared by world/groups consecutive ranks.
+                    groups = _div(loc.shape[0], rows_local)
+                    ranks_per_group = _div(world, groups)
+                    src_row0 = (self.tp_rank // ranks_per_group) * rows_local
                 plan.parts.append(
                     LoadPart(
-                        ckpt_name=ckpt_name,
+                        ckpt_name=f"{prefix}{comp}.weight",
                         kind=_KIND_COLUMN,
                         rows_local=rows_local,
                         dst_dim0_offset=dst,
+                        src_row0=src_row0,
                     )
                 )
                 dst += rows_local
@@ -685,7 +707,7 @@ class Hf3fsModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra = load_config.model_loader_extra_config or {}
-        allowed = {"slice_threshold", "iov_size", "io_entries", "numa"}
+        allowed = {"slice_threshold", "iov_size", "io_entries", "numa", "slice"}
         unexpected = set(extra.keys()) - allowed
         if unexpected:
             raise ValueError(f"unexpected hf3fs loader config keys: {unexpected}")
@@ -693,6 +715,13 @@ class Hf3fsModelLoader(BaseModelLoader):
         self.iov_size = int(extra.get("iov_size", _IOV_SIZE))
         self.io_entries = int(extra.get("io_entries", 1024))
         self.numa = int(extra.get("numa", -1))
+        # slice=False: A/B arm for ablation — Column tensors are still read via
+        # USRBIO (cache-bypassing) but in FULL, then narrowed locally. This
+        # mirrors the default loader's 8x read amplification with identical
+        # semantics, giving a clean slice-on vs slice-off physical-read compare.
+        self.slice_enabled = bool(extra.get("slice", True))
+        self._mmap_cache: Dict[str, "mmap.mmap"] = {}
+        self._mmap_files: List = []
 
     def download_model(self, model_config: ModelConfig) -> None:
         if not os.path.isdir(model_config.model_path):
@@ -702,10 +731,17 @@ class Hf3fsModelLoader(BaseModelLoader):
             )
 
     def _fuse_read_tensor(self, loc: TensorLoc) -> torch.Tensor:
-        with open(loc.file, "rb") as f:
-            f.seek(loc.start)
-            buf = f.read(loc.nbytes)
-        arr = np.frombuffer(buf, dtype=np.uint8)
+        # mmap (not plain read) so that all TP ranks on this node share the same
+        # page-cache pages for Row/Replicate tensors. With plain open/read on a
+        # 3FS FUSE mount every rank pulls its own copy over the network, which
+        # degrades Row+Replicate traffic to world_size x model size.
+        mm = self._mmap_cache.get(loc.file)
+        if mm is None:
+            f = open(loc.file, "rb")
+            mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+            self._mmap_cache[loc.file] = mm
+            self._mmap_files.append(f)
+        arr = np.frombuffer(mm, dtype=np.uint8, count=loc.nbytes, offset=loc.start)
         return torch.from_numpy(arr.copy()).view(loc.torch_dtype).reshape(loc.shape)
 
     def _read_column_segment(
@@ -715,8 +751,9 @@ class Hf3fsModelLoader(BaseModelLoader):
         loc: TensorLoc,
         rows_local: int,
         tp_rank: int,
+        src_row0: Optional[int] = None,
     ) -> torch.Tensor:
-        ranges = column_segment_ranges(loc, tp_rank, rows_local)
+        ranges = column_segment_ranges(loc, tp_rank, rows_local, start_row=src_row0)
         if not ranges:
             return None  # fully-padding rank
         fd = fd_cache.get(loc.file)
@@ -726,6 +763,13 @@ class Hf3fsModelLoader(BaseModelLoader):
             assert rc <= 0, f"hf3fs_reg_fd: {rc}"
             fd_cache[loc.file] = fd
         row_bytes = loc.nbytes // loc.shape[0]
+        if not self.slice_enabled:
+            # slice-off arm: full USRBIO read of the tensor, narrow locally
+            full = reader.read_tensor(fd, [(loc.start, loc.end)], loc.torch_dtype)
+            full = full.reshape(loc.shape[0], *loc.shape[1:])
+            start_row = (ranges[0][0] - loc.start) // row_bytes
+            nrows = sum(e - s for s, e in ranges) // row_bytes
+            return full.narrow(0, start_row, nrows)
         nrows = sum(e - s for s, e in ranges) // row_bytes
         t = reader.read_tensor(fd, ranges, loc.torch_dtype)
         return t.reshape(nrows, *loc.shape[1:])
@@ -811,7 +855,8 @@ class Hf3fsModelLoader(BaseModelLoader):
                         )
                         if part.kind == _KIND_COLUMN:
                             seg = self._read_column_segment(
-                                reader, fd_cache, loc, part.rows_local, tp_rank
+                                reader, fd_cache, loc, part.rows_local, tp_rank,
+                                part.src_row0,
                             )
                             if seg is None:
                                 continue  # fully-padding rank
@@ -850,6 +895,12 @@ class Hf3fsModelLoader(BaseModelLoader):
                     os.close(fd)
                 physical_read = reader.bytes_read
                 reader.close()
+                for mm in self._mmap_cache.values():
+                    mm.close()
+                for f in self._mmap_files:
+                    f.close()
+                self._mmap_cache.clear()
+                self._mmap_files.clear()
 
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")

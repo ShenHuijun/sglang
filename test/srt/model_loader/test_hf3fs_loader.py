@@ -225,6 +225,30 @@ class TestShardPlanner:
                 ((Q_ROWS + 2 * KV_ROWS) // N, H),
             )
 
+    def test_qkv_gqa_kv_head_replication(self):
+        # num_kv_heads(4) < tp(8): each rank holds ONE full kv head and two
+        # consecutive ranks share head rank//2 -- kv rows_local must be
+        # inferred from the param shape (not ckpt_rows/world) and the ckpt
+        # start row overridden via src_row0.
+        idx = _qwen3_like_ckpt()
+        kv_local = KV_ROWS // 4  # 4 kv heads in ckpt
+        q_local = Q_ROWS // N
+        pshape = (q_local + 2 * kv_local, H)
+        for rank in (0, 3, 7):
+            plan = _planner(idx, rank=rank).plan_param(
+                "model.layers.0.self_attn.qkv_proj.weight", pshape
+            )
+            q, k, v = plan.parts
+            assert q.rows_local == q_local and q.src_row0 is None
+            for pt in (k, v):
+                assert pt.rows_local == kv_local
+                assert pt.src_row0 == (rank // 2) * kv_local
+            assert [pt.dst_dim0_offset for pt in plan.parts] == [
+                0,
+                q_local,
+                q_local + kv_local,
+            ]
+
     def test_w13_gate_front_up_back(self):
         idx = _qwen3_like_ckpt()
         plan = _planner(idx).plan_param(
