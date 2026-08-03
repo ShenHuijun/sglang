@@ -395,7 +395,7 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
+        allowed_keys = {"enable_multithread_load", "num_threads", "mount_template"}
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
@@ -482,6 +482,26 @@ class DefaultModelLoader(BaseModelLoader):
             )
         else:
             hf_folder = model_name_or_path
+
+        # --- Per-rank mount-point routing (hope/hf3fs-dsv3) ---
+        # When running TP across multiple FUSE mount points (each backed by a
+        # different NIC), allow each rank to read weights from its own mount.
+        # Priority: --model-loader-extra-config '{"mount_template": "..."}'
+        #         > env SGLANG_PER_RANK_MODEL_PATH_TEMPLATE
+        # Template uses "{rank}" as placeholder, e.g.
+        #   /3fs/mnt_nic{rank}/models/Qwen3-30B-A3B
+        # If neither is set, behaviour is unchanged (backward-compatible).
+        _mount_tpl = self.load_config.model_loader_extra_config.get(
+            "mount_template"
+        ) or os.environ.get("SGLANG_PER_RANK_MODEL_PATH_TEMPLATE")
+        if _mount_tpl:
+            _tp_rank = get_parallel().tp_rank
+            hf_folder = _mount_tpl.format(rank=_tp_rank)
+            logger.info(
+                "Per-rank mount routing: tp_rank=%d -> model path: %s",
+                _tp_rank,
+                hf_folder,
+            )
 
         server_args = get_server_args()
         if server_args and server_args.model_checksum is not None:
