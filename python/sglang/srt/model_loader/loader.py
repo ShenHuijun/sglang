@@ -352,6 +352,59 @@ class BaseModelLoader(ABC):
         raise NotImplementedError
 
 
+def _maybe_enable_presharded_weights(model, load_config, model_config) -> None:
+    """Detect per-rank pre-sharded weights and flip every layer's
+    ``use_presharded_weights`` flag so weight_loaders skip their narrow().
+
+    Trigger (either one):
+      * env ``SGLANG_PRESHARDED_WEIGHTS`` is truthy, or
+      * a ``.presharded`` marker file exists in this rank's resolved model dir
+        (the per-rank mount template is resolved the same way as in
+        _prepare_weights: extra-config ``mount_template`` >
+        env ``SGLANG_PER_RANK_MODEL_PATH_TEMPLATE`` > model_config.model_path).
+
+    The marker is written by numa_aligned_prefetch.py into /dev/shm/rank{i}/.
+    Flipping the flag post-construction is safe: linear params are always
+    allocated at the per-partition size, and the presharded checkpoint rows
+    match org_vocab_size/tp_size for the embedding path.
+    """
+    env_on = os.environ.get("SGLANG_PRESHARDED_WEIGHTS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    marker_on = False
+    if not env_on:
+        extra = load_config.model_loader_extra_config or {}
+        tpl = extra.get("mount_template") or os.environ.get(
+            "SGLANG_PER_RANK_MODEL_PATH_TEMPLATE"
+        )
+        rank_dir = (
+            tpl.format(rank=get_parallel().tp_rank)
+            if tpl
+            else model_config.model_path
+        )
+        marker_on = os.path.exists(os.path.join(rank_dir, ".presharded"))
+
+    if not (env_on or marker_on):
+        return
+
+    model.use_presharded_weights = True
+    flipped = 0
+    for m in model.modules():
+        if getattr(m, "use_presharded_weights", None) is False:
+            m.use_presharded_weights = True
+            flipped += 1
+    logger.info(
+        "Pre-sharded weights enabled (env=%s marker=%s): flipped %d modules; "
+        "weight_loader narrow() will be skipped.",
+        env_on,
+        marker_on,
+        flipped,
+    )
+
+
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -813,6 +866,9 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            _maybe_enable_presharded_weights(
+                model, self.load_config, model_config
+            )
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
