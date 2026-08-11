@@ -18,6 +18,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import (
@@ -1291,6 +1292,47 @@ def _s3_iter_safetensors(
         yield name, tensor.reshape(meta["shape"])
 
 
+def _s3_stream_weights_iterator(
+    hf_weights_files: List[str],
+    target: Tuple[str, int, Optional[str], str],
+    num_conns: int = 16,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Yield weights fetched straight from the object store, one shard at a time.
+
+    Only the object *names* come from ``hf_weights_files`` (basenames are used as
+    keys), so the local model directory needs metadata only -- the shard files
+    may be empty placeholders. Peak host RAM is one shard, because the buffer is
+    released as soon as the consumer has walked its tensors.
+    """
+    host, port, dev, prefix = target
+    logger.info(
+        "Streaming weights from object store: dev=%s endpoint=[%s]:%d prefix=%s "
+        "objects=%d",
+        dev,
+        host,
+        port,
+        prefix,
+        len(hf_weights_files),
+    )
+    fetched = 0
+    net_seconds = 0.0
+    for path in sorted(hf_weights_files):
+        name = os.path.basename(path)
+        start = time.perf_counter()
+        buf = _s3_range_get(host, port, dev, prefix, name, num_conns=num_conns)
+        net_seconds += time.perf_counter() - start
+        fetched += buf.nbytes
+        yield from _s3_iter_safetensors(buf)
+        del buf
+    logger.info(
+        "Streamed %.2f GB in %.2f s (%.2f GB/s) on dev=%s",
+        fetched / 1e9,
+        net_seconds,
+        fetched / max(net_seconds, 1e-9) / 1e9,
+        dev,
+    )
+
+
 def buffered_multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
@@ -1305,6 +1347,13 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
+    stream_target = _s3_stream_target()
+    if stream_target is not None:
+        yield from _s3_stream_weights_iterator(
+            hf_weights_files, stream_target, num_conns=max(max_workers, 16)
+        )
+        return
+
     if prefetch and not disable_mmap:
         _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
