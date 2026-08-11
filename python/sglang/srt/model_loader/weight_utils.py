@@ -1303,6 +1303,41 @@ def _s3_stream_weights_iterator(
     keys), so the local model directory needs metadata only -- the shard files
     may be empty placeholders. Peak host RAM is one shard, because the buffer is
     released as soon as the consumer has walked its tensors.
+
+    Usage::
+
+        base='h0,h1,h2,h3|9000,9001,9002,9003|eth0,eth1,eth2,eth3|/bucket'
+        SGLANG_S3_STREAM_BASE="$base" python3 -m sglang.launch_server \\
+            --model-path /dev/shm/meta_only --tp 4 --load-format auto
+
+    ``/dev/shm/meta_only`` holds symlinked config/tokenizer/index plus one empty
+    file per shard, so no weight byte ever lands on local storage.
+
+    Server side requirements: HTTP/1.1 with ``Range`` and keep-alive (a server
+    that closes after each response, e.g. HTTP/1.0, will fail the load). To make
+    the *return* path use the intended NIC the server must also be split per
+    NIC, with ``SO_BINDTODEVICE`` set on its listening socket -- otherwise the
+    routing table picks one egress link for every rank and only the client side
+    is spread out.
+
+    Measured on a 4-NIC host, Qwen3-30B-A3B (57 GiB, 16 shards), TP=4, one
+    endpoint per NIC, objects served from the storage node's RAM:
+
+    * 3.4 s of network time per rank (~17 GB/s per NIC, ~71 GB/s aggregate),
+      7.75 s total ``Load weight`` including header parse, narrow and H2D --
+      versus 25.0 s for the same model read cold from a local NVMe and 42.0 s
+      over a FUSE-mounted distributed filesystem.
+    * Outputs matched the file-based baseline token for token (greedy, 5 prompts).
+
+    Cost and limitations to keep in mind:
+
+    * Every rank pulls *all* shards, because ``auto`` semantics require each rank
+      to see every tensor before it narrows. Total network volume is therefore
+      ``tp_size x checkpoint_size`` (246 GB in the run above). This is exactly
+      why per-rank NIC pinning matters here: on a single shared NIC the same
+      volume took ~2x longer.
+    * Shards are fetched serially, so network time is not overlapped with H2D.
+    * No retry: a failed range aborts the load rather than silently degrading.
     """
     host, port, dev, prefix = target
     logger.info(
