@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import re
+import socket
 import struct
 import tempfile
+import threading
 from collections import defaultdict
 from pathlib import Path
 from typing import (
@@ -1078,6 +1080,215 @@ def multi_thread_safetensors_weights_iterator(
             del state_dict
             if drop_cache_after_load:
                 _drop_file_cache_after_load(st_file)
+
+
+# ---------------------------------------------------------------------------
+# Streaming weights straight out of an object store (HTTP GET Range)
+#
+# Motivation: on a host with several NICs, remote weights can be read faster
+# than local disk, but only if (a) many connections are used and (b) each TP
+# rank drives its own NIC. Neither is reachable through a POSIX/FUSE mount --
+# the kernel picks the egress NIC from the routing table, so all ranks end up
+# sharing one link. An object store moves that decision into user space: every
+# rank opens its own sockets and can pin them with SO_BINDTODEVICE.
+# ---------------------------------------------------------------------------
+
+# SOL_SOCKET option number for SO_BINDTODEVICE; python's socket module does not
+# expose it, and it requires CAP_NET_RAW (present by default in containers).
+_SO_BINDTODEVICE = 25
+
+# safetensors header dtype string -> torch dtype attribute name
+_S3_STREAM_DTYPES = {
+    "BF16": "bfloat16",
+    "F16": "float16",
+    "F32": "float32",
+    "F64": "float64",
+    "I8": "int8",
+    "I16": "int16",
+    "I32": "int32",
+    "I64": "int64",
+    "U8": "uint8",
+    "BOOL": "bool",
+    "F8_E4M3": "float8_e4m3fn",
+    "F8_E5M2": "float8_e5m2",
+}
+
+
+def _s3_stream_target() -> Optional[Tuple[str, int, Optional[str], str]]:
+    """Resolve this rank's object-store endpoint from ``SGLANG_S3_STREAM_BASE``.
+
+    Format: ``"host0,host1|port0,port1|dev0,dev1|/prefix"``. The i-th entry of
+    each comma-separated list belongs to TP rank i (shorter lists wrap around),
+    which is what lets rank i talk to its NIC-local endpoint. An empty ``dev``
+    entry leaves the egress NIC to the routing table.
+
+    Returns None when the variable is unset, so callers fall back to their
+    normal file-based path.
+    """
+    spec = os.environ.get("SGLANG_S3_STREAM_BASE")
+    if not spec:
+        return None
+    try:
+        hosts, ports, devs, prefix = spec.split("|")
+    except ValueError as e:
+        raise ValueError(
+            "SGLANG_S3_STREAM_BASE must be 'hosts|ports|devices|prefix', "
+            f"got {spec!r}"
+        ) from e
+    rank = get_parallel().tp_rank
+    host_list = hosts.split(",")
+    port_list = ports.split(",")
+    dev_list = devs.split(",")
+    return (
+        host_list[rank % len(host_list)],
+        int(port_list[rank % len(port_list)]),
+        dev_list[rank % len(dev_list)] or None,
+        prefix,
+    )
+
+
+def _s3_connect(host: str, port: int, dev: Optional[str]) -> socket.socket:
+    """Open a TCP connection, optionally pinned to ``dev`` via SO_BINDTODEVICE."""
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    if dev:
+        sock.setsockopt(socket.SOL_SOCKET, _SO_BINDTODEVICE, dev.encode() + b"\0")
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.connect((host, port))
+    return sock
+
+
+def _s3_read_headers(sock: socket.socket, pending: bytes) -> Tuple[int, bytes]:
+    """Read one HTTP response header block.
+
+    Returns ``(content_length, leftover_body_bytes)``; ``pending`` carries over
+    bytes already read past the previous response on a keep-alive connection.
+    """
+    buf = pending
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("connection closed while reading HTTP headers")
+        buf += chunk
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    status = head.split(b"\r\n", 1)[0]
+    if not (b" 200" in status or b" 206" in status):
+        raise ConnectionError(f"unexpected HTTP status: {status!r}")
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            return int(line.split(b":", 1)[1]), rest
+    raise ConnectionError("HTTP response without Content-Length")
+
+
+def _s3_range_get(
+    host: str,
+    port: int,
+    dev: Optional[str],
+    prefix: str,
+    name: str,
+    num_conns: int = 16,
+    chunk_bytes: int = 32 << 20,
+) -> np.ndarray:
+    """Fetch one object into a uint8 array with ``num_conns`` parallel readers.
+
+    Ranges are handed out from a shared cursor and each worker keeps one
+    keep-alive connection, so all connections stay busy even though objects
+    (model shards) differ in size. ``chunk_bytes`` should stay large (>= 16 MB):
+    request rate, not bandwidth, is what object stores throttle first.
+    """
+    probe = _s3_connect(host, port, dev)
+    try:
+        probe.sendall(
+            f"HEAD {prefix}/{name} HTTP/1.1\r\nHost: sglang\r\n"
+            f"Connection: close\r\n\r\n".encode()
+        )
+        size, _ = _s3_read_headers(probe, b"")
+    finally:
+        probe.close()
+
+    out = np.empty(size, dtype=np.uint8)
+    view = memoryview(out.data).cast("B")
+    ranges = [
+        (off, min(chunk_bytes, size - off)) for off in range(0, size, chunk_bytes)
+    ]
+    cursor = itertools.count()
+    errors: List[BaseException] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        sock = None
+        try:
+            sock = _s3_connect(host, port, dev)
+            pending = b""
+            for index in cursor:
+                if index >= len(ranges):
+                    return
+                offset, length = ranges[index]
+                sock.sendall(
+                    f"GET {prefix}/{name} HTTP/1.1\r\nHost: sglang\r\n"
+                    f"Range: bytes={offset}-{offset + length - 1}\r\n"
+                    f"Connection: keep-alive\r\n\r\n".encode()
+                )
+                expected, pending = _s3_read_headers(sock, pending)
+                dst = view[offset : offset + expected]
+                got = 0
+                if pending:
+                    take = min(len(pending), expected)
+                    dst[:take] = pending[:take]
+                    got = take
+                    pending = pending[take:]
+                while got < expected:
+                    read = sock.recv_into(dst[got:], min(4 << 20, expected - got))
+                    if read == 0:
+                        raise ConnectionError("connection closed mid-body")
+                    got += read
+        except BaseException as e:  # noqa: BLE001 - surfaced by the caller
+            with lock:
+                errors.append(e)
+        finally:
+            if sock is not None:
+                sock.close()
+
+    workers = [
+        threading.Thread(target=worker, daemon=True)
+        for _ in range(max(1, min(num_conns, len(ranges))))
+    ]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    if errors:
+        raise errors[0]
+    return out
+
+
+def _s3_iter_safetensors(
+    buf: np.ndarray,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Yield ``(name, tensor)`` from an in-memory safetensors image, zero-copy.
+
+    ``safetensors.torch.load()`` would copy the whole shard once more, which at
+    these sizes is several GB per shard. The container format is trivial to walk
+    instead: 8-byte little-endian header length, JSON header, then the data
+    blob, so every tensor can be a ``torch.frombuffer`` view onto ``buf``.
+    The caller must keep ``buf`` alive while the tensors are in use.
+    """
+    view = memoryview(buf.data).cast("B")
+    header_len = int.from_bytes(bytes(view[:8]), "little")
+    header = json.loads(bytes(view[8 : 8 + header_len]))
+    data_start = 8 + header_len
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        start, end = meta["data_offsets"]
+        dtype = getattr(torch, _S3_STREAM_DTYPES[meta["dtype"]])
+        if end > start:
+            tensor = torch.frombuffer(
+                view[data_start + start : data_start + end], dtype=dtype
+            )
+        else:
+            tensor = torch.empty(0, dtype=dtype)
+        yield name, tensor.reshape(meta["shape"])
 
 
 def buffered_multi_thread_safetensors_weights_iterator(
